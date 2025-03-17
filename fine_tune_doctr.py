@@ -26,6 +26,18 @@ class OCRDataset(Dataset):
     def __init__(self, data_dir, transform=None, target_height=32):
         self.data_dir = data_dir
         self.image_files = [f for f in os.listdir(data_dir) if f.endswith(('.jpg', '.jpeg', '.png'))]
+        
+        # Verify label existence
+        missing_labels = []
+        for f in self.image_files:
+            label_path = os.path.join(self.data_dir, f.replace('.jpg', '.txt')
+                                      .replace('.jpeg', '.txt')
+                                      .replace('.png', '.txt'))
+            if not os.path.exists(label_path):
+                missing_labels.append(f)
+        if missing_labels:
+            raise ValueError(f"Missing labels for {len(missing_labels)} images")
+        
         self.transform = transform
         self.target_height = target_height
 
@@ -78,16 +90,29 @@ class OCRDataset(Dataset):
             return None, None
 
 def get_transforms(train=False):
-    transforms = [
-        A.Affine(scale=(0.95, 1.05)),  # Mild scaling
-        A.RandomBrightnessContrast(p=0.3),  # Color variations
-        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+    transforms = []
+    if train:
+        transforms.extend([
+            A.Affine(
+                scale=(0.8, 1.2),
+                rotate=(-15, 15),
+                shear=(-10, 10),
+                translate_percent=(-0.1, 0.1),
+                p=0.8
+            ),
+            A.GaussianBlur(blur_limit=(3, 7), p=0.3),
+            A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.5),
+            A.GaussNoise(var_limit=(10, 50), p=0.3),
+            A.OpticalDistortion(distort_limit=0.2, p=0.3)
+        ])
+    
+    transforms.extend([
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2()
-    ]
-    return A.Compose(transforms) if train else A.Compose(transforms[-2:])
+    ])
+    return A.Compose(transforms)
 
 def collate_fn(batch):
-    # Filter invalid samples
     batch = [data for data in batch if data is not None and data[0] is not None]
     if not batch:
         return torch.Tensor(), []
@@ -104,17 +129,12 @@ def collate_fn(batch):
     return torch.stack(padded_images), list(labels)
 
 def initialize_model():
-    # Load base model and extend vocabulary
     original_model = crnn_vgg16_bn(pretrained=True)
-    
-    # Add ₹ symbol to vocabulary
     original_vocab = list(original_model.vocab)
     updated_vocab = original_vocab + ['₹']
     
-    # Create new model with extended vocab
     model = crnn_vgg16_bn(pretrained=False, vocab=''.join(updated_vocab))
     
-    # Transfer weights (except final layer)
     pretrained_state = original_model.state_dict()
     for layer in ['linear.weight', 'linear.bias', 
                  'classifier.weight', 'classifier.bias',
@@ -127,31 +147,47 @@ def initialize_model():
 
 def train_model(train_path, val_path, num_epochs=10, batch_size=32, 
                 lr=3e-4, model_path="rupee_model.pt"):
-    # Initialize model
+    best_cer = float('inf')
+    best_epoch = 0
+    history = {
+        'train_loss': [],
+        'val_cer': [],
+        'val_wer': []
+    }
+    
     model = initialize_model()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     
-    # Data loaders
     train_dataset = OCRDataset(train_path, get_transforms(True))
     val_dataset = OCRDataset(val_path, get_transforms(False))
     
-    train_loader = DataLoader(train_dataset, batch_size, shuffle=True, 
-                             collate_fn=collate_fn, num_workers=2)
-    val_loader = DataLoader(val_dataset, batch_size, 
-                           collate_fn=collate_fn, num_workers=2)
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=4,
+        pin_memory=True
+    )
     
-    # Optimizer
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size*2,
+        collate_fn=collate_fn,
+        num_workers=4,
+        pin_memory=True
+    )
+    
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     
-    # Training loop
     for epoch in range(num_epochs):
         model.train()
         train_loss = 0.0
         
-        # Training phase
+        # Training
         for images, labels in tqdm.tqdm(train_loader, 
-                                       desc=f"Epoch {epoch+1}/{num_epochs}"):
+                                      desc=f"Epoch {epoch+1}/{num_epochs}"):
             if images.nelement() == 0:
                 continue
             
@@ -165,7 +201,7 @@ def train_model(train_path, val_path, num_epochs=10, batch_size=32,
             
             train_loss += loss.item()
         
-        # Update the validation loop section
+        # Validation
         model.eval()
         all_preds, all_gts = [], []
         with torch.no_grad():
@@ -176,52 +212,48 @@ def train_model(train_path, val_path, num_epochs=10, batch_size=32,
                 images = images.to(device)
                 output = model(images)
                 
-                # Universal prediction handler
                 current_preds = []
+                raw_preds = output['preds']
                 
-                # Case 1: Direct string predictions (newest doctr)
-                if isinstance(output['preds'], list) and all(isinstance(p, str) for p in output['preds']):
-                    current_preds = output['preds']
+                if isinstance(raw_preds, tuple):
+                    raw_preds = raw_preds[0]
                 
-                # Case 2: Tensor/tuple predictions (older versions)
-                else:
-                    raw_preds = output['preds']
-                    
-                    # Handle different output structures
-                    if isinstance(raw_preds, tuple):
-                        # Extract logits from (logits, seq_lens)
-                        raw_preds = raw_preds[0]
-                    
-                    if isinstance(raw_preds, torch.Tensor):
-                        # Single tensor case
-                        raw_preds = [raw_preds]
-                    
-                    # Process each prediction element
-                    for p in raw_preds:
-                        if isinstance(p, torch.Tensor):
-                            # Convert tensor to numpy
-                            p = p.cpu().numpy()
-                        if isinstance(p, np.ndarray):
-                            # Decode numerical predictions
-                            decoded = ''.join([model.vocab[i] for i in p if i < len(model.vocab)])
-                            current_preds.append(decoded)
+                if isinstance(raw_preds, torch.Tensor):
+                    raw_preds = [raw_preds]
+                
+                for p in raw_preds:
+                    if isinstance(p, torch.Tensor):
+                        p = p.cpu().numpy()
+                    if isinstance(p, np.ndarray):
+                        decoded = ''.join([model.vocab[i] for i in p if i < len(model.vocab)])
+                        current_preds.append(decoded)
                 
                 all_preds.extend(current_preds)
                 all_gts.extend(labels)
         
         # Calculate metrics
-        if len(all_gts) == 0:
-            print("No validation samples processed")
-            cer = wer = 0.0
-        else:
+        cer, wer = 0.0, 0.0
+        if len(all_gts) > 0 and len(all_preds) > 0:
             cer = sum(character_error_rate(g, p) for g,p in zip(all_gts, all_preds)) / len(all_gts)
             wer = sum(word_error_rate(g, p) for g,p in zip(all_gts, all_preds)) / len(all_gts)
+        
+        # Update history
+        history['train_loss'].append(train_loss/len(train_loader))
+        history['val_cer'].append(cer)
+        history['val_wer'].append(wer)
         
         print(f"\nEpoch {epoch+1}/{num_epochs}")
         print(f"Train Loss: {train_loss/len(train_loader):.4f}")
         print(f"Validation CER: {cer:.4f} | WER: {wer:.4f}")
         
-        # Save model
+        # Save best model
+        if cer < best_cer:
+            best_cer = cer
+            best_epoch = epoch + 1
+            torch.save(model.state_dict(), "rupee_model_best.pt")
+            print(f"New best model saved at epoch {best_epoch}")
+        
+        # Save checkpoint
         torch.save(model.state_dict(), model_path)
         print(f"Model saved to {model_path}")
 
