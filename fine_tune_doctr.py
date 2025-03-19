@@ -94,16 +94,19 @@ def get_transforms(train=False):
     if train:
         transforms.extend([
             A.Affine(
-                scale=(0.8, 1.2),
-                rotate=(-15, 15),
-                shear=(-10, 10),
-                translate_percent=(-0.1, 0.1),
-                p=0.8
+                scale=(0.9, 1.1),  # Reduced augmentation strength
+                rotate=(-10, 10),
+                shear=(-5, 5),
+                translate_percent=(-0.05, 0.05),
+                p=0.7
             ),
-            A.GaussianBlur(blur_limit=(3, 7), p=0.3),
-            A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.5),
-            A.GaussNoise(var_limit=(10, 50), p=0.3),
-            A.OpticalDistortion(distort_limit=0.2, p=0.3)
+            A.GaussianBlur(blur_limit=(3, 5), p=0.2),  # Reduced blur
+            A.RandomBrightnessContrast(
+                brightness_limit=0.2, 
+                contrast_limit=0.2, 
+                p=0.4
+            ),
+            A.GaussNoise(var_limit=(0.05, 0.2), p=0.2),
         ])
     
     transforms.extend([
@@ -131,22 +134,41 @@ def collate_fn(batch):
 def initialize_model():
     original_model = crnn_vgg16_bn(pretrained=True)
     original_vocab = list(original_model.vocab)
+    
+    # Verify digit presence
+    missing_digits = [str(i) for i in range(10) if str(i) not in original_vocab]
+    if missing_digits:
+        raise ValueError(f"Missing digits in pretrained vocab: {missing_digits}")
+    
+    # Add rupee symbol
     updated_vocab = original_vocab + ['₹']
     
+    # Create new model with extended vocabulary
     model = crnn_vgg16_bn(pretrained=False, vocab=''.join(updated_vocab))
     
+    # Handle size mismatch for new character
     pretrained_state = original_model.state_dict()
-    for layer in ['linear.weight', 'linear.bias', 
-                 'classifier.weight', 'classifier.bias',
-                 'head.0.weight', 'head.0.bias']:
-        if layer in pretrained_state:
-            del pretrained_state[layer]
     
+    # Copy weights for existing characters
+    for layer in ['linear.weight', 'linear.bias']:
+        if layer in pretrained_state:
+            # Original shape: [num_original_chars, ...]
+            original_weight = pretrained_state[layer]
+            
+            # New shape: [num_original_chars + 1, ...]
+            new_weight = model.state_dict()[layer].clone()
+            
+            # Copy original weights for existing characters
+            new_weight[:original_weight.shape[0]] = original_weight
+            
+            # Initialize new character weights (₹) with zeros
+            pretrained_state[layer] = new_weight
+
     model.load_state_dict(pretrained_state, strict=False)
     return model
 
-def train_model(train_path, val_path, num_epochs=10, batch_size=32, 
-                lr=3e-4, model_path="rupee_model.pt"):
+def train_model(train_path, val_path, num_epochs=20, batch_size=32,  # Increased epochs
+                lr=1e-4, model_path="rupee_model.pt"):  # Reduced learning rate
     best_cer = float('inf')
     best_epoch = 0
     history = {
@@ -161,6 +183,12 @@ def train_model(train_path, val_path, num_epochs=10, batch_size=32,
     
     train_dataset = OCRDataset(train_path, get_transforms(True))
     val_dataset = OCRDataset(val_path, get_transforms(False))
+    
+    # Check for overlapping files
+    train_files = set(train_dataset.image_files)
+    val_files = set(val_dataset.image_files)
+    overlap = train_files & val_files
+    print(f"Overlapping files: {len(overlap)}")
     
     train_loader = DataLoader(
         train_dataset, 
@@ -185,7 +213,7 @@ def train_model(train_path, val_path, num_epochs=10, batch_size=32,
         model.train()
         train_loss = 0.0
         
-        # Training
+        # Training loop
         for images, labels in tqdm.tqdm(train_loader, 
                                       desc=f"Epoch {epoch+1}/{num_epochs}"):
             if images.nelement() == 0:
@@ -201,7 +229,7 @@ def train_model(train_path, val_path, num_epochs=10, batch_size=32,
             
             train_loss += loss.item()
         
-        # Validation
+        # Validation loop
         model.eval()
         all_preds, all_gts = [], []
         with torch.no_grad():
@@ -212,32 +240,26 @@ def train_model(train_path, val_path, num_epochs=10, batch_size=32,
                 images = images.to(device)
                 output = model(images)
                 
-                current_preds = []
+                # Direct prediction extraction
                 raw_preds = output['preds']
+                current_preds = [pred[0] for pred in raw_preds]
                 
-                if isinstance(raw_preds, tuple):
-                    raw_preds = raw_preds[0]
+                # Confidence filtering
+                filtered_preds = [
+                    p if conf > 0.4 else "" 
+                    for p, (_, conf) in zip(current_preds, raw_preds)
+                ]
                 
-                if isinstance(raw_preds, torch.Tensor):
-                    raw_preds = [raw_preds]
-                
-                for p in raw_preds:
-                    if isinstance(p, torch.Tensor):
-                        p = p.cpu().numpy()
-                    if isinstance(p, np.ndarray):
-                        decoded = ''.join([model.vocab[i] for i in p if i < len(model.vocab)])
-                        current_preds.append(decoded)
-                
-                all_preds.extend(current_preds)
+                all_preds.extend(filtered_preds)
                 all_gts.extend(labels)
         
         # Calculate metrics
         cer, wer = 0.0, 0.0
-        if len(all_gts) > 0 and len(all_preds) > 0:
+        if len(all_gts) > 0:
             cer = sum(character_error_rate(g, p) for g,p in zip(all_gts, all_preds)) / len(all_gts)
             wer = sum(word_error_rate(g, p) for g,p in zip(all_gts, all_preds)) / len(all_gts)
         
-        # Update history
+        # Update tracking
         history['train_loss'].append(train_loss/len(train_loader))
         history['val_cer'].append(cer)
         history['val_wer'].append(wer)
@@ -253,17 +275,16 @@ def train_model(train_path, val_path, num_epochs=10, batch_size=32,
             torch.save(model.state_dict(), "rupee_model_best.pt")
             print(f"New best model saved at epoch {best_epoch}")
         
-        # Save checkpoint
+        # Regular checkpoint
         torch.save(model.state_dict(), model_path)
-        print(f"Model saved to {model_path}")
 
 if __name__ == "__main__":
     mp.freeze_support()
     train_model(
         train_path="data/train/",
         val_path="data/val/",
-        num_epochs=10,
+        num_epochs=20,
         batch_size=32,
-        lr=3e-4,
+        lr=1e-4,
         model_path="rupee_model.pt"
     )
